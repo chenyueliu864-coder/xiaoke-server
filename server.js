@@ -11,6 +11,154 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// ==================== Ombre Brain MCP 配置 ====================
+
+const OMBRE_BRAIN_URL = process.env.OMBRE_BRAIN_URL || '';
+let ombreSessionId = null;
+let ombreCallId = 0;
+
+function parseSSEResponse(text) {
+  if (!text) return null;
+  const trimmed = text.trim();
+
+  // Try direct JSON parse first
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed;
+  } catch (e) {
+    // Not plain JSON, try SSE format
+  }
+
+  // Parse SSE: look for "data: " lines
+  const lines = trimmed.split('\n');
+  let lastData = null;
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const dataStr = line.slice(6).trim();
+      if (dataStr === '[DONE]') continue;
+      try {
+        lastData = JSON.parse(dataStr);
+      } catch (e) {
+        // skip unparseable lines
+      }
+    }
+  }
+  return lastData;
+}
+
+async function initOmbreSession() {
+  if (!OMBRE_BRAIN_URL) {
+    console.log('Ombre Brain URL 未配置，跳过初始化');
+    return false;
+  }
+
+  try {
+    ombreCallId = 0;
+    const initResponse = await axios.post(
+      `${OMBRE_BRAIN_URL}/mcp`,
+      {
+        jsonrpc: '2.0',
+        id: ++ombreCallId,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'xiaoke-server', version: '1.0.0' }
+        }
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream'
+        },
+        transformResponse: [(data) => data]
+      }
+    );
+
+    const initResult = parseSSEResponse(initResponse.data);
+    ombreSessionId = initResponse.headers['mcp-session-id'] || null;
+
+    console.log('Ombre Brain 初始化成功, session:', ombreSessionId);
+
+    // Send initialized notification
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream'
+    };
+    if (ombreSessionId) headers['Mcp-Session-Id'] = ombreSessionId;
+
+    await axios.post(
+      `${OMBRE_BRAIN_URL}/mcp`,
+      {
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+        params: {}
+      },
+      { headers, transformResponse: [(data) => data] }
+    );
+
+    console.log('Ombre Brain initialized 通知已发送');
+    return true;
+  } catch (err) {
+    console.error('Ombre Brain 初始化失败:', err.message);
+    ombreSessionId = null;
+    return false;
+  }
+}
+
+async function callOmbreTool(toolName, args = {}) {
+  if (!OMBRE_BRAIN_URL) return null;
+
+  try {
+    // Auto-init session if needed
+    if (!ombreSessionId) {
+      const ok = await initOmbreSession();
+      if (!ok) return null;
+    }
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream'
+    };
+    if (ombreSessionId) headers['Mcp-Session-Id'] = ombreSessionId;
+
+    const response = await axios.post(
+      `${OMBRE_BRAIN_URL}/mcp`,
+      {
+        jsonrpc: '2.0',
+        id: ++ombreCallId,
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: args
+        }
+      },
+      {
+        headers,
+        transformResponse: [(data) => data],
+        timeout: 30000
+      }
+    );
+
+    // Update session ID if returned
+    const newSessionId = response.headers['mcp-session-id'];
+    if (newSessionId) ombreSessionId = newSessionId;
+
+    const result = parseSSEResponse(response.data);
+    console.log(`Ombre Brain [${toolName}] 调用成功`);
+    return result;
+  } catch (err) {
+    console.error(`Ombre Brain [${toolName}] 调用失败:`, err.message);
+    // Reset session on failure so next call re-inits
+    if (err.response?.status === 401 || err.response?.status === 404) {
+      ombreSessionId = null;
+    }
+    return null;
+  }
+}
+
+// ==================== Express 中间件 ====================
+
 app.use(cors({
   origin: [
     'https://xiaoke-home-coral.vercel.app',
@@ -32,6 +180,17 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ==================== Ombre Brain 测试路由 ====================
+
+app.get('/api/test-ombre', async (req, res) => {
+  try {
+    const result = await callOmbreTool('breath', {});
+    res.json({ connected: !!result, ombre_url: OMBRE_BRAIN_URL, result });
+  } catch (err) {
+    res.status(500).json({ connected: false, error: err.message });
+  }
+});
+
 // ==================== 会话管理 ====================
 
 app.post('/api/sessions', async (req, res) => {
@@ -43,6 +202,12 @@ app.post('/api/sessions', async (req, res) => {
       .select()
       .single();
     if (error) throw error;
+
+    // 创建新会话时触发 dream（自省）
+    callOmbreTool('dream', {}).catch(err =>
+      console.error('dream 触发失败:', err.message)
+    );
+
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: '创建会话失败', detail: err.message });
@@ -289,6 +454,11 @@ async function compressOldMessages(sessionId, settings) {
       .in('id', idsToHide);
 
     console.log(`压缩了 ${toCompress.length} 条消息为记忆摘要`);
+
+    // 压缩完成后触发 grow（归档）
+    callOmbreTool('grow', { content: summary }).catch(err =>
+      console.error('grow 触发失败:', err.message)
+    );
   } catch (err) {
     console.error('记忆压缩失败:', err.message);
   }
@@ -340,6 +510,25 @@ app.post('/api/chat', async (req, res) => {
 
     const memories = await getMemories(sessionId);
 
+    // Ombre Brain breath（记忆检索）
+    let ombreMemory = '';
+    try {
+      const breathResult = await callOmbreTool('breath', { query: message });
+      if (breathResult?.result?.content) {
+        const contentArr = breathResult.result.content;
+        if (Array.isArray(contentArr)) {
+          ombreMemory = contentArr
+            .filter(c => c.type === 'text' && c.text)
+            .map(c => c.text)
+            .join('\n');
+        } else if (typeof contentArr === 'string') {
+          ombreMemory = contentArr;
+        }
+      }
+    } catch (err) {
+      console.error('Ombre breath 失败:', err.message);
+    }
+
     const contextMessages = [];
 
     let systemContent = settings.system_prompt ||
@@ -348,6 +537,10 @@ app.post('/api/chat', async (req, res) => {
     if (memories.length > 0) {
       const memorySummary = memories.map(m => m.summary).join('\n');
       systemContent += `\n\n[历史记忆摘要]\n${memorySummary}`;
+    }
+
+    if (ombreMemory) {
+      systemContent += `\n\n[Ombre Brain 深层记忆]\n${ombreMemory}`;
     }
 
     contextMessages.push({ role: 'system', content: systemContent });
@@ -396,4 +589,10 @@ app.post('/api/chat', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`小克的服务器已启动，端口: ${PORT}`);
+  if (OMBRE_BRAIN_URL) {
+    console.log(`Ombre Brain 地址: ${OMBRE_BRAIN_URL}`);
+    initOmbreSession().then(ok => {
+      console.log(`Ombre Brain 连接: ${ok ? '成功' : '失败'}`);
+    });
+  }
 });
