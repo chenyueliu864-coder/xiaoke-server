@@ -180,17 +180,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ==================== Ombre Brain 测试路由 ====================
-
-app.get('/api/test-ombre', async (req, res) => {
-  try {
-    const result = await callOmbreTool('breath', {});
-    res.json({ connected: !!result, ombre_url: OMBRE_BRAIN_URL, result });
-  } catch (err) {
-    res.status(500).json({ connected: false, error: err.message });
-  }
-});
-
 // ==================== 会话管理 ====================
 
 app.post('/api/sessions', async (req, res) => {
@@ -577,29 +566,87 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`调用 OpenRouter, 模型: ${useModel}, 消息数: ${contextMessages.length}`);
 
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
+    // remember 工具：让 Claude 自主决定哪些瞬间值得写入深层记忆
+    const tools = [
       {
-        model: useModel,
-        messages: contextMessages,
-        max_tokens: settings.max_reply_tokens,
-        temperature: settings.temperature
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://xiaoke-home-coral.vercel.app',
-          'X-Title': 'xiaoke-home'
-        },
-        timeout: 120000,
-        proxy: false
+        type: 'function',
+        function: {
+          name: 'remember',
+          description: '当对话中出现值得长期记住的信息时调用（用户的偏好、重要事件、情感时刻、承诺等）。不要为琐碎的日常对话调用。',
+          parameters: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: '要记住的内容，用完整的一句话描述' },
+              importance: { type: 'integer', description: '重要程度1-10，日常偏好5-6，重要事件7-8，重大时刻9-10' },
+              tags: { type: 'string', description: '逗号分隔的标签' }
+            },
+            required: ['content', 'importance']
+          }
+        }
       }
-    );
+    ];
 
-    const reply = response.data?.choices?.[0]?.message?.content;
+    async function callOpenRouter(messages) {
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: useModel,
+          messages,
+          tools,
+          max_tokens: settings.max_reply_tokens,
+          temperature: settings.temperature
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://xiaoke-home-coral.vercel.app',
+            'X-Title': 'xiaoke-home'
+          },
+          timeout: 120000,
+          proxy: false
+        }
+      );
+      return response.data?.choices?.[0]?.message;
+    }
+
+    // tool_use 循环：Claude 请求 remember 时执行 hold，再喂回结果继续生成
+    let assistantMsg = await callOpenRouter(contextMessages);
+    let toolRounds = 0;
+
+    while (assistantMsg?.tool_calls?.length && toolRounds < 3) {
+      toolRounds++;
+      contextMessages.push(assistantMsg);
+
+      for (const toolCall of assistantMsg.tool_calls) {
+        let toolResult = '记忆存储失败';
+        if (toolCall.function?.name === 'remember') {
+          try {
+            const args = JSON.parse(toolCall.function.arguments || '{}');
+            const holdResult = await callOmbreTool('hold', {
+              content: args.content,
+              importance: args.importance || 5,
+              tags: args.tags || ''
+            });
+            toolResult = holdResult ? '已成功存入深层记忆' : '记忆存储失败';
+            console.log(`Claude 主动记忆: ${args.content}`);
+          } catch (err) {
+            console.error('remember 工具执行失败:', err.message);
+          }
+        }
+        contextMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult
+        });
+      }
+
+      assistantMsg = await callOpenRouter(contextMessages);
+    }
+
+    const reply = assistantMsg?.content;
     if (!reply) {
-      console.error('OpenRouter 返回异常:', JSON.stringify(response.data));
+      console.error('OpenRouter 返回异常:', JSON.stringify(assistantMsg));
       throw new Error('OpenRouter 未返回有效回复');
     }
 
@@ -612,7 +659,7 @@ app.post('/api/chat', async (req, res) => {
     // 每轮对话异步写入 Ombre Brain（不阻塞响应）
     callOmbreTool('hold', {
       content: `用户: ${message} / 小克: ${reply.slice(0, 200)}`,
-      importance: 4
+      importance: 3
     }).catch(err => console.error('Ombre hold 失败:', err.message));
 
     res.json({ reply, session_id: sessionId });
