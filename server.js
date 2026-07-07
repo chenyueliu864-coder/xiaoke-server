@@ -7,13 +7,11 @@ const { createClient } = require('@supabase/supabase-js');
 // 强制 axios 使用传统 http adapter（避免 undici fetch 问题）
 axios.defaults.adapter = 'http';
 
-// 确保全局有稳定的 fetch 实现（Supabase 客户端依赖）
-if (!globalThis.fetch) {
-  globalThis.fetch = fetch;
-  globalThis.Headers = fetch.Headers;
-  globalThis.Request = fetch.Request;
-  globalThis.Response = fetch.Response;
-}
+// 用 node-fetch 覆盖全局 fetch（Node 28 内置 fetch 在 Render 上不稳定）
+globalThis.fetch = fetch;
+globalThis.Headers = fetch.Headers;
+globalThis.Request = fetch.Request;
+globalThis.Response = fetch.Response;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
