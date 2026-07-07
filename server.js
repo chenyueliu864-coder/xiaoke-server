@@ -337,6 +337,54 @@ app.put('/api/settings', async (req, res) => {
   }
 });
 
+// ==================== 用量统计 ====================
+
+app.get('/api/usage/stats', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('usage_log')
+      .select('session_id, model, input_tokens, output_tokens, cost_usd, created_at');
+    if (error) throw error;
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
+    const empty = () => ({ cost_usd: 0, input_tokens: 0, output_tokens: 0, rounds: 0 });
+    const today = empty();
+    const total = empty();
+    const bySession = {};
+
+    for (const r of rows || []) {
+      const buckets = [total];
+      if (new Date(r.created_at) >= todayStart) buckets.push(today);
+      for (const b of buckets) {
+        b.cost_usd += Number(r.cost_usd) || 0;
+        b.input_tokens += r.input_tokens || 0;
+        b.output_tokens += r.output_tokens || 0;
+        b.rounds += 1;
+      }
+      const key = r.session_id ?? 'unknown';
+      if (!bySession[key]) bySession[key] = { session_id: key, ...empty() };
+      bySession[key].cost_usd += Number(r.cost_usd) || 0;
+      bySession[key].input_tokens += r.input_tokens || 0;
+      bySession[key].output_tokens += r.output_tokens || 0;
+      bySession[key].rounds += 1;
+    }
+
+    // 带上会话名，方便前端展示
+    const { data: sessions } = await supabase.from('sessions').select('id, name');
+    const nameMap = {};
+    for (const s of sessions || []) nameMap[s.id] = s.name;
+    const sessionRanking = Object.values(bySession)
+      .map(s => ({ ...s, name: nameMap[s.session_id] || `会话 ${s.session_id}` }))
+      .sort((a, b) => b.cost_usd - a.cost_usd);
+
+    res.json({ today, total, sessions: sessionRanking });
+  } catch (err) {
+    res.status(500).json({ error: '获取用量统计失败', detail: err.message });
+  }
+});
+
 // ==================== 辅助函数 ====================
 
 function estimateTokens(text) {
@@ -586,6 +634,9 @@ app.post('/api/chat', async (req, res) => {
       }
     ];
 
+    // 累计本次请求的 token 用量（tool_use 可能多轮调用）
+    const usageTotal = { input: 0, output: 0, cost: 0 };
+
     async function callOpenRouter(messages) {
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -594,7 +645,8 @@ app.post('/api/chat', async (req, res) => {
           messages,
           tools,
           max_tokens: settings.max_reply_tokens,
-          temperature: settings.temperature
+          temperature: settings.temperature,
+          usage: { include: true }
         },
         {
           headers: {
@@ -607,6 +659,12 @@ app.post('/api/chat', async (req, res) => {
           proxy: false
         }
       );
+      const usage = response.data?.usage;
+      if (usage) {
+        usageTotal.input += usage.prompt_tokens || 0;
+        usageTotal.output += usage.completion_tokens || 0;
+        usageTotal.cost += usage.cost || 0;
+      }
       return response.data?.choices?.[0]?.message;
     }
 
@@ -654,6 +712,17 @@ app.post('/api/chat', async (req, res) => {
       session_id: sessionId,
       role: 'assistant',
       content: reply
+    });
+
+    // 用量日志（表不存在时静默失败，不影响对话）
+    supabase.from('usage_log').insert({
+      session_id: sessionId,
+      model: useModel,
+      input_tokens: usageTotal.input,
+      output_tokens: usageTotal.output,
+      cost_usd: usageTotal.cost
+    }).then(({ error }) => {
+      if (error) console.error('用量日志写入失败:', error.message);
     });
 
     // 每轮对话异步写入 Ombre Brain（不阻塞响应）
