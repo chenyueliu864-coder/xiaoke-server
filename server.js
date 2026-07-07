@@ -3,6 +3,8 @@ const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
+axios.defaults.adapter = 'http';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
