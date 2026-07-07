@@ -516,6 +516,18 @@ app.post('/api/chat', async (req, res) => {
 
     const memories = await getMemories(sessionId);
 
+    // Ombre Brain hold（关键词触发的显式记忆写入）
+    let heldToMemory = false;
+    const holdMatch = message.match(/^(小克记住|记住)[，,：:\s]*/);
+    if (holdMatch) {
+      const holdResult = await callOmbreTool('hold', {
+        content: message.slice(holdMatch[0].length) || message,
+        tags: '用户指令',
+        importance: 7
+      });
+      heldToMemory = !!holdResult;
+    }
+
     // Ombre Brain breath（记忆检索）
     let ombreMemory = '';
     try {
@@ -547,6 +559,10 @@ app.post('/api/chat', async (req, res) => {
 
     if (ombreMemory) {
       systemContent += `\n\n[Ombre Brain 深层记忆]\n${ombreMemory}`;
+    }
+
+    if (heldToMemory) {
+      systemContent += `\n\n[系统提示] 用户刚才要求记住的内容已成功存入深层记忆库，请在回复中自然地确认这一点。`;
     }
 
     contextMessages.push({ role: 'system', content: systemContent });
@@ -592,6 +608,12 @@ app.post('/api/chat', async (req, res) => {
       role: 'assistant',
       content: reply
     });
+
+    // 每轮对话异步写入 Ombre Brain（不阻塞响应）
+    callOmbreTool('hold', {
+      content: `用户: ${message} / 小克: ${reply.slice(0, 200)}`,
+      importance: 4
+    }).catch(err => console.error('Ombre hold 失败:', err.message));
 
     res.json({ reply, session_id: sessionId });
 
