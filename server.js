@@ -435,11 +435,17 @@ async function compressOldMessages(sessionId, settings) {
         headers: {
           'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 60000,
+        proxy: false
       }
     );
 
-    const summary = response.data.choices[0].message.content;
+    const summary = response.data?.choices?.[0]?.message?.content;
+    if (!summary) {
+      console.error('压缩摘要返回异常:', JSON.stringify(response.data));
+      return;
+    }
 
     await supabase.from('memories').insert({
       session_id: sessionId,
@@ -553,6 +559,8 @@ app.post('/api/chat', async (req, res) => {
 
     const useModel = model || 'anthropic/claude-sonnet-4-6';
 
+    console.log(`调用 OpenRouter, 模型: ${useModel}, 消息数: ${contextMessages.length}`);
+
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
@@ -567,11 +575,17 @@ app.post('/api/chat', async (req, res) => {
           'Content-Type': 'application/json',
           'HTTP-Referer': 'https://xiaoke-home-coral.vercel.app',
           'X-Title': 'xiaoke-home'
-        }
+        },
+        timeout: 120000,
+        proxy: false
       }
     );
 
-    const reply = response.data.choices[0].message.content;
+    const reply = response.data?.choices?.[0]?.message?.content;
+    if (!reply) {
+      console.error('OpenRouter 返回异常:', JSON.stringify(response.data));
+      throw new Error('OpenRouter 未返回有效回复');
+    }
 
     await supabase.from('messages').insert({
       session_id: sessionId,
@@ -582,8 +596,19 @@ app.post('/api/chat', async (req, res) => {
     res.json({ reply, session_id: sessionId });
 
   } catch (err) {
-    console.error('对话接口错误:', err.response?.data || err.message);
-    res.status(500).json({ error: '对话失败', detail: err.response?.data || err.message });
+    console.error('对话接口错误:');
+    console.error('  类型:', err.constructor?.name);
+    console.error('  消息:', err.message);
+    console.error('  代码:', err.code);
+    if (err.response) {
+      console.error('  状态码:', err.response.status);
+      console.error('  响应体:', JSON.stringify(err.response.data));
+    }
+    if (err.cause) {
+      console.error('  原因:', err.cause.message || err.cause);
+    }
+    const detail = err.response?.data || err.message;
+    res.status(500).json({ error: '对话失败', detail });
   }
 });
 
