@@ -1,7 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const multer = require('multer');
+const AdmZip = require('adm-zip');
 const { createClient } = require('@supabase/supabase-js');
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -337,6 +341,429 @@ app.put('/api/settings', async (req, res) => {
   }
 });
 
+// ==================== 表情包 ====================
+
+app.get('/api/stickers', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('stickers')
+      .select('*')
+      .order('id', { ascending: true });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取表情包失败', detail: err.message });
+  }
+});
+
+app.post('/api/stickers', async (req, res) => {
+  try {
+    const { filename } = req.body;
+    let { label } = req.body;
+    if (!filename) return res.status(400).json({ error: 'filename 不能为空' });
+
+    // 没给标签时用视觉模型自动生成
+    if (!label) {
+      try {
+        const imageUrl = filename.startsWith('http')
+          ? filename
+          : `https://xiaoke-home-coral.vercel.app${filename}`;
+        const visionRes = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: 'anthropic/claude-haiku-4.5',
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: '用10个字以内描述这个表情包表达的情绪或动作，只输出描述本身。' },
+                { type: 'image_url', image_url: { url: imageUrl } }
+              ]
+            }],
+            max_tokens: 50
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 60000,
+            proxy: false
+          }
+        );
+        label = visionRes.data?.choices?.[0]?.message?.content?.trim() || '表情';
+      } catch (e) {
+        console.error('表情标签生成失败:', e.message);
+        label = '表情';
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('stickers')
+      .insert({ filename, label })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '添加表情包失败', detail: err.message });
+  }
+});
+
+app.delete('/api/stickers/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('stickers').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '删除表情包失败', detail: err.message });
+  }
+});
+
+// ==================== 记忆库 ====================
+
+app.get('/api/memories', async (req, res) => {
+  try {
+    let query = supabase
+      .from('memories')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .limit(100);
+    if (req.query.date) {
+      const day = req.query.date; // YYYY-MM-DD
+      query = query.gte('timestamp', `${day}T00:00:00`).lt('timestamp', `${day}T23:59:59`);
+    }
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取记忆失败', detail: err.message });
+  }
+});
+
+app.get('/api/memories/buckets', async (req, res) => {
+  try {
+    const result = await callOmbreTool('pulse', { include_archive: false });
+    let text = '';
+    const content = result?.result?.content;
+    if (Array.isArray(content)) {
+      text = content.filter(c => c.type === 'text' && c.text).map(c => c.text).join('\n');
+    }
+    res.json({ connected: !!result, raw: text });
+  } catch (err) {
+    res.status(500).json({ error: '获取记忆桶失败', detail: err.message });
+  }
+});
+
+app.get('/api/memories/:id/comments', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('comments')
+      .select('*')
+      .eq('memory_id', req.params.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取评论失败', detail: err.message });
+  }
+});
+
+app.post('/api/memories/:id/comments', async (req, res) => {
+  try {
+    const memoryId = req.params.id;
+    const { content, ai } = req.body;
+
+    let finalContent = content;
+    let author = '小月';
+
+    if (ai) {
+      // 让小克对这条记忆说一句话
+      const { data: memory } = await supabase
+        .from('memories')
+        .select('summary')
+        .eq('id', memoryId)
+        .single();
+      if (!memory) return res.status(404).json({ error: '记忆不存在' });
+
+      const settings = await getSettings(0);
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: 'anthropic/claude-sonnet-4-6',
+          messages: [
+            { role: 'system', content: settings.system_prompt || '你是小克。' },
+            { role: 'user', content: `这是我们的一段回忆：\n\n${memory.summary}\n\n请用一两句话评论这段回忆，像翻旧照片时随口说的那种感觉，温暖自然。` }
+          ],
+          max_tokens: 200
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 60000,
+          proxy: false
+        }
+      );
+      finalContent = response.data?.choices?.[0]?.message?.content;
+      author = '小克';
+      if (!finalContent) throw new Error('AI 评论生成失败');
+    }
+
+    if (!finalContent) return res.status(400).json({ error: '评论内容不能为空' });
+
+    const { data, error } = await supabase
+      .from('comments')
+      .insert({ memory_id: memoryId, author, content: finalContent })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '添加评论失败', detail: err.message });
+  }
+});
+
+// ==================== 书斋 ====================
+
+function stripHtml(html) {
+  return html
+    .replace(/<(style|script)[\s\S]*?<\/\1>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|h[1-6]|li|blockquote)>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+const COVER_COLORS = ['#8B6F47', '#5B7065', '#7A5A6E', '#4E6E8E', '#8E5A4E', '#6E5A8E', '#5A8E6E'];
+
+app.post('/api/books/upload', upload.single('epub'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '没有收到文件' });
+
+    const zip = new AdmZip(req.file.buffer);
+
+    // 1. container.xml → opf 路径
+    const containerEntry = zip.getEntry('META-INF/container.xml');
+    if (!containerEntry) throw new Error('不是有效的 epub 文件');
+    const containerXml = containerEntry.getData().toString('utf8');
+    const opfPath = containerXml.match(/full-path="([^"]+)"/)?.[1];
+    if (!opfPath) throw new Error('epub 缺少 opf 描述文件');
+
+    const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
+    const opfXml = zip.getEntry(opfPath).getData().toString('utf8');
+
+    // 2. 元数据
+    const title = opfXml.match(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/)?.[1]?.trim() || req.file.originalname.replace(/\.epub$/i, '');
+    const author = opfXml.match(/<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/)?.[1]?.trim() || '佚名';
+
+    // 3. manifest: id → href
+    const manifest = {};
+    for (const m of opfXml.matchAll(/<item\s[^>]*?id="([^"]+)"[^>]*?href="([^"]+)"[^>]*?\/?>/g)) {
+      manifest[m[1]] = m[2];
+    }
+    // 兼容属性顺序不同的写法
+    for (const m of opfXml.matchAll(/<item\s[^>]*?href="([^"]+)"[^>]*?id="([^"]+)"[^>]*?\/?>/g)) {
+      if (!manifest[m[2]]) manifest[m[2]] = m[1];
+    }
+
+    // 4. spine 顺序
+    const spineIds = [...opfXml.matchAll(/<itemref\s[^>]*?idref="([^"]+)"/g)].map(m => m[1]);
+
+    // 5. 逐章提取文本
+    const chapters = [];
+    for (const id of spineIds) {
+      const href = manifest[id];
+      if (!href) continue;
+      const entry = zip.getEntry(opfDir + href) || zip.getEntry(decodeURIComponent(opfDir + href));
+      if (!entry) continue;
+      const html = entry.getData().toString('utf8');
+      const chapterTitle = html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/)?.[1]?.replace(/<[^>]+>/g, '').trim()
+        || html.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1]?.trim()
+        || `第 ${chapters.length + 1} 章`;
+      const text = stripHtml(html);
+      if (text.length < 20) continue; // 跳过封面/目录等空页
+      chapters.push({ title: chapterTitle, content: text });
+    }
+
+    if (chapters.length === 0) throw new Error('没有解析出任何章节内容');
+
+    const coverColor = COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)];
+    const { data: book, error: bookErr } = await supabase
+      .from('books')
+      .insert({ title, author, cover_color: coverColor })
+      .select()
+      .single();
+    if (bookErr) throw bookErr;
+
+    const rows = chapters.map((c, i) => ({
+      book_id: book.id, idx: i, title: c.title, content: c.content
+    }));
+    // 分批插入，避免单次 payload 过大
+    for (let i = 0; i < rows.length; i += 20) {
+      const { error: chErr } = await supabase.from('chapters').insert(rows.slice(i, i + 20));
+      if (chErr) throw chErr;
+    }
+
+    res.json({ ...book, chapter_count: chapters.length });
+  } catch (err) {
+    console.error('epub 上传失败:', err.message);
+    res.status(500).json({ error: 'epub 解析失败', detail: err.message });
+  }
+});
+
+app.post('/api/books/text', async (req, res) => {
+  try {
+    const { title, author, content } = req.body;
+    if (!title || !content) return res.status(400).json({ error: '标题和内容不能为空' });
+
+    const coverColor = COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)];
+    const { data: book, error: bookErr } = await supabase
+      .from('books')
+      .insert({ title, author: author || '小月摘录', cover_color: coverColor })
+      .select()
+      .single();
+    if (bookErr) throw bookErr;
+
+    const { error: chErr } = await supabase
+      .from('chapters')
+      .insert({ book_id: book.id, idx: 0, title, content });
+    if (chErr) throw chErr;
+
+    res.json({ ...book, chapter_count: 1 });
+  } catch (err) {
+    res.status(500).json({ error: '创建短篇失败', detail: err.message });
+  }
+});
+
+app.get('/api/books', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('books')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取书架失败', detail: err.message });
+  }
+});
+
+app.delete('/api/books/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('books').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '删除书失败', detail: err.message });
+  }
+});
+
+app.get('/api/books/:id/chapters', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('idx, title')
+      .eq('book_id', req.params.id)
+      .order('idx', { ascending: true });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取目录失败', detail: err.message });
+  }
+});
+
+app.get('/api/books/:id/chapters/:idx', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('chapters')
+      .select('*')
+      .eq('book_id', req.params.id)
+      .eq('idx', req.params.idx)
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取章节失败', detail: err.message });
+  }
+});
+
+app.get('/api/books/:id/progress', async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('reading_progress')
+      .select('*')
+      .eq('book_id', req.params.id)
+      .single();
+    res.json(data || { book_id: Number(req.params.id), chapter_idx: 0, scroll_pct: 0 });
+  } catch (err) {
+    res.status(500).json({ error: '获取进度失败', detail: err.message });
+  }
+});
+
+app.put('/api/books/:id/progress', async (req, res) => {
+  try {
+    const bookId = req.params.id;
+    const { chapter_idx, scroll_pct } = req.body;
+    const { data: existing } = await supabase
+      .from('reading_progress')
+      .select('id')
+      .eq('book_id', bookId)
+      .single();
+
+    if (existing) {
+      await supabase
+        .from('reading_progress')
+        .update({ chapter_idx, scroll_pct, updated_at: new Date().toISOString() })
+        .eq('book_id', bookId);
+    } else {
+      await supabase
+        .from('reading_progress')
+        .insert({ book_id: bookId, chapter_idx, scroll_pct });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: '保存进度失败', detail: err.message });
+  }
+});
+
+app.get('/api/books/:id/annotations', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('annotations')
+      .select('*')
+      .eq('book_id', req.params.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '获取标注失败', detail: err.message });
+  }
+});
+
+app.post('/api/books/:id/annotations', async (req, res) => {
+  try {
+    const { chapter_idx, quote, note } = req.body;
+    if (!quote) return res.status(400).json({ error: '标注内容不能为空' });
+    const { data, error } = await supabase
+      .from('annotations')
+      .insert({ book_id: req.params.id, chapter_idx, quote, note })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '保存标注失败', detail: err.message });
+  }
+});
+
 // ==================== 用量统计 ====================
 
 app.get('/api/usage/stats', async (req, res) => {
@@ -511,7 +938,7 @@ async function compressOldMessages(sessionId, settings) {
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, model, session_id } = req.body;
+    const { message, model, session_id, context } = req.body;
 
     if (!message) {
       return res.status(400).json({ error: '消息不能为空' });
@@ -600,6 +1027,22 @@ app.post('/api/chat', async (req, res) => {
 
     if (heldToMemory) {
       systemContent += `\n\n[系统提示] 用户刚才要求记住的内容已成功存入深层记忆库，请在回复中自然地确认这一点。`;
+    }
+
+    // 书内聊天：注入当前阅读上下文
+    if (context) {
+      systemContent += `\n\n[当前阅读上下文] 小月正在读下面这段文字，对话围绕它展开：\n${String(context).slice(0, 6000)}`;
+    }
+
+    // 表情包：注入可用列表，允许小克用 [sticker:N] 发表情
+    try {
+      const { data: stickers } = await supabase.from('stickers').select('id, label').limit(50);
+      if (stickers && stickers.length > 0) {
+        const list = stickers.map(s => `[sticker:${s.id}] ${s.label}`).join('、');
+        systemContent += `\n\n[表情包] 你可以在回复中穿插表情，格式为 [sticker:数字]，可用：${list}。合适的时候用一个就好，不要滥用。`;
+      }
+    } catch (e) {
+      // stickers 表异常时忽略
     }
 
     contextMessages.push({ role: 'system', content: systemContent });
