@@ -764,6 +764,117 @@ app.post('/api/books/:id/annotations', async (req, res) => {
   }
 });
 
+// ==================== 五子棋 ====================
+
+app.post('/api/gomoku/move', async (req, res) => {
+  try {
+    const { moves } = req.body; // [{x, y, role: 'user'|'ai'}]
+    if (!Array.isArray(moves)) return res.status(400).json({ error: 'moves 必须是数组' });
+
+    // 组装棋盘文本（15x15，.空 X玩家 O小克）
+    const board = Array.from({ length: 15 }, () => Array(15).fill('.'));
+    for (const m of moves) {
+      if (m.x >= 0 && m.x < 15 && m.y >= 0 && m.y < 15) {
+        board[m.y][m.x] = m.role === 'user' ? 'X' : 'O';
+      }
+    }
+    const boardText = '   ' + [...Array(15).keys()].map(i => String(i).padStart(2)).join('') + '\n' +
+      board.map((row, y) => String(y).padStart(2) + ' ' + row.map(c => ' ' + c).join('')).join('\n');
+
+    let aiMove = null;
+    try {
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: 'deepseek/deepseek-chat',
+          messages: [
+            {
+              role: 'system',
+              content: '你是五子棋高手。棋盘15x15，X是对手棋子，O是你的棋子，.是空位。你执O。分析局面后选择你的最佳落子位置。必须选空位(.)。只输出JSON，格式：{"x":列号,"y":行号}，不要输出任何其他内容。'
+            },
+            { role: 'user', content: `当前棋盘：\n${boardText}\n\n轮到你落子(O)，只返回JSON坐标。` }
+          ],
+          max_tokens: 100,
+          temperature: 0.3
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 60000,
+          proxy: false
+        }
+      );
+      const text = response.data?.choices?.[0]?.message?.content || '';
+      const jsonMatch = text.match(/\{[^}]*"x"\s*:\s*(\d+)[^}]*"y"\s*:\s*(\d+)[^}]*\}/) ||
+                        text.match(/\{[^}]*"y"\s*:\s*(\d+)[^}]*"x"\s*:\s*(\d+)[^}]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(text.match(/\{[^}]*\}/)[0]);
+        if (Number.isInteger(parsed.x) && Number.isInteger(parsed.y)) aiMove = parsed;
+      }
+    } catch (e) {
+      console.error('五子棋 AI 走棋失败:', e.message);
+    }
+
+    // 合法性校验，非法则兜底：找最后一手玩家棋子附近的空位
+    const isValid = (m) => m && m.x >= 0 && m.x < 15 && m.y >= 0 && m.y < 15 && board[m.y][m.x] === '.';
+    if (!isValid(aiMove)) {
+      const lastUser = [...moves].reverse().find(m => m.role === 'user') || { x: 7, y: 7 };
+      const candidates = [];
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const x = lastUser.x + dx, y = lastUser.y + dy;
+          if (x >= 0 && x < 15 && y >= 0 && y < 15 && board[y][x] === '.') candidates.push({ x, y });
+        }
+      }
+      if (candidates.length === 0) {
+        for (let y = 0; y < 15; y++) for (let x = 0; x < 15; x++) {
+          if (board[y][x] === '.') candidates.push({ x, y });
+        }
+      }
+      aiMove = candidates[Math.floor(Math.random() * candidates.length)] || null;
+    }
+
+    if (!aiMove) return res.json({ full: true });
+    res.json(aiMove);
+  } catch (err) {
+    res.status(500).json({ error: '走棋失败', detail: err.message });
+  }
+});
+
+// ==================== 戳一戳 ====================
+
+app.get('/api/poke', async (req, res) => {
+  try {
+    const settings = await getSettings(0);
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: 'anthropic/claude-haiku-4.5',
+        messages: [
+          { role: 'system', content: settings.system_prompt || '你是小克，小月的AI伙伴。' },
+          { role: 'user', content: '（小月戳了戳你）用一句话回应，可以是关心、调侃或者可爱的抱怨，30字以内，不要引号。' }
+        ],
+        max_tokens: 80,
+        temperature: 1.0
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000,
+        proxy: false
+      }
+    );
+    const text = response.data?.choices?.[0]?.message?.content?.trim() || '嗯？戳我干嘛~';
+    res.json({ text });
+  } catch (err) {
+    res.json({ text: '（小克揉了揉眼睛）网络有点卡，再戳一次试试？' });
+  }
+});
+
 // ==================== 用量统计 ====================
 
 app.get('/api/usage/stats', async (req, res) => {
