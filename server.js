@@ -1192,16 +1192,21 @@ app.post('/api/chat', async (req, res) => {
     const usageTotal = { input: 0, output: 0, cost: 0 };
 
     async function callOpenRouter(messages) {
+      const body = {
+        model: useModel,
+        messages,
+        tools,
+        max_tokens: settings.max_reply_tokens,
+        temperature: settings.temperature,
+        usage: { include: true }
+      };
+      // 推理模型：请求返回思考链
+      if (useModel.includes('deepseek-r1')) {
+        body.reasoning = { enabled: true };
+      }
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: useModel,
-          messages,
-          tools,
-          max_tokens: settings.max_reply_tokens,
-          temperature: settings.temperature,
-          usage: { include: true }
-        },
+        body,
         {
           headers: {
             'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -1256,7 +1261,11 @@ app.post('/api/chat', async (req, res) => {
       assistantMsg = await callOpenRouter(contextMessages);
     }
 
-    const reply = assistantMsg?.content;
+    let reply = assistantMsg?.content;
+    // 思考链：包成 <think> 块，前端会折叠展示
+    if (reply && assistantMsg?.reasoning) {
+      reply = `<think>${assistantMsg.reasoning}</think>\n${reply}`;
+    }
     if (!reply) {
       console.error('OpenRouter 返回异常:', JSON.stringify(assistantMsg));
       throw new Error('OpenRouter 未返回有效回复');
