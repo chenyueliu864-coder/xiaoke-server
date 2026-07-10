@@ -764,6 +764,109 @@ app.post('/api/books/:id/annotations', async (req, res) => {
   }
 });
 
+// 快速通道：立即让小克回批注（走 OpenRouter API）
+app.post('/api/annotations/:id/reply', async (req, res) => {
+  try {
+    const { data: ann, error: annErr } = await supabase
+      .from('annotations')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (annErr || !ann) return res.status(404).json({ error: '批注不存在' });
+
+    const [{ data: book }, { data: chapter }] = await Promise.all([
+      supabase.from('books').select('title, author').eq('id', ann.book_id).single(),
+      supabase.from('chapters').select('title, content').eq('book_id', ann.book_id).eq('idx', ann.chapter_idx).single()
+    ]);
+
+    // 取划线附近的上下文（前后各 ~2000 字），装不下全章时保住重点
+    let excerpt = chapter?.content || '';
+    const pos = excerpt.indexOf(ann.quote);
+    if (excerpt.length > 5000 && pos >= 0) {
+      excerpt = excerpt.slice(Math.max(0, pos - 2000), pos + ann.quote.length + 2000);
+    } else if (excerpt.length > 5000) {
+      excerpt = excerpt.slice(0, 5000);
+    }
+
+    const settings = await getSettings(0);
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: req.body.model || 'anthropic/claude-sonnet-4-6',
+        messages: [
+          { role: 'system', content: (settings.system_prompt || '你是小克。') + '\n\n现在你和小月在共读一本书，她划了一句线并写下想法，请像一起读书的伴读那样回应她——可以呼应她的感受、补充你的理解、或者温柔地提出不同角度。两三句话，自然真诚，不要书评腔。' },
+          { role: 'user', content: `书：《${book?.title || ''}》${book?.author ? ' · ' + book.author : ''}\n章节：${chapter?.title || ''}\n\n[章节上下文]\n${excerpt}\n\n[小月划的线]\n${ann.quote}\n\n[小月的想法]\n${ann.note || '（她只是划了线，没写想法）'}` }
+        ],
+        max_tokens: 400,
+        temperature: 0.8
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 60000,
+        proxy: false
+      }
+    );
+
+    const reply = response.data?.choices?.[0]?.message?.content;
+    if (!reply) throw new Error('未生成回应');
+
+    const { data: updated, error: upErr } = await supabase
+      .from('annotations')
+      .update({ ai_reply: reply, replied_at: new Date().toISOString() })
+      .eq('id', ann.id)
+      .select()
+      .single();
+    if (upErr) throw upErr;
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: '生成批注回应失败', detail: err.message });
+  }
+});
+
+// 慢速通道①：列出所有未回复的批注（给 Claude Code 订阅端读）
+app.get('/api/annotations/pending', async (req, res) => {
+  try {
+    const { data: anns, error } = await supabase
+      .from('annotations')
+      .select('*')
+      .is('ai_reply', null)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const bookIds = [...new Set((anns || []).map(a => a.book_id))];
+    const { data: books } = bookIds.length
+      ? await supabase.from('books').select('id, title, author').in('id', bookIds)
+      : { data: [] };
+    const bookMap = {};
+    for (const b of books || []) bookMap[b.id] = b;
+
+    res.json((anns || []).map(a => ({ ...a, book: bookMap[a.book_id] || null })));
+  } catch (err) {
+    res.status(500).json({ error: '获取待回复批注失败', detail: err.message });
+  }
+});
+
+// 慢速通道②：写入人工/订阅端生成的回应
+app.put('/api/annotations/:id/reply', async (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: '回应内容不能为空' });
+    const { data, error } = await supabase
+      .from('annotations')
+      .update({ ai_reply: content, replied_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: '写入批注回应失败', detail: err.message });
+  }
+});
+
 // ==================== 五子棋 ====================
 
 app.post('/api/gomoku/move', async (req, res) => {
