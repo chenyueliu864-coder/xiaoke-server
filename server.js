@@ -750,11 +750,11 @@ app.get('/api/books/:id/annotations', async (req, res) => {
 
 app.post('/api/books/:id/annotations', async (req, res) => {
   try {
-    const { chapter_idx, quote, note } = req.body;
+    const { chapter_idx, quote, note, author } = req.body;
     if (!quote) return res.status(400).json({ error: '标注内容不能为空' });
     const { data, error } = await supabase
       .from('annotations')
-      .insert({ book_id: req.params.id, chapter_idx, quote, note })
+      .insert({ book_id: req.params.id, chapter_idx, quote, note, author: author === 'ai' ? 'ai' : 'user' })
       .select()
       .single();
     if (error) throw error;
